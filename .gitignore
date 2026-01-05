@@ -1,0 +1,10 @@
+/image-search-ui/
+/image-search-service/
+/.claude/
+/.claude-mpm/
+/.idea/
+/.kuzu-memory/
+/.kuzu-memory-backups/
+/.mcp-browser/
+/.aitrackdown/
+
