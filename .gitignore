@@ -8,3 +8,12 @@
 /.mcp-browser/
 /.aitrackdown/
 
+
+# MCP Vector Search index directory
+.mcp-vector-search/
+
+# MCP Ticketer
+.mcp-ticketer/
+
+# MCP configuration (contains tokens)
+.mcp.json

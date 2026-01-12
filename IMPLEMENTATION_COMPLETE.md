@@ -1,12 +1,15 @@
 # Training Progress Multi-Phase Tracking - Implementation Complete
 
 **Date**: 2026-01-12
-**Status**: ✅ Phases 1 and 2 Complete, Ready for Testing
+**Status**: ✅ Phases 1 and 2 Complete + Bug Fixes, Ready for Testing
 **Commits**:
-- Phase 1 Frontend: `903b2aa` (image-search-ui)
 - Documentation: `d653835` (root)
+- Phase 1 Frontend: `903b2aa` (image-search-ui)
 - Phase 2 Backend: `6998075` (image-search-service)
 - Phase 2 Frontend: `dcea29b` (image-search-ui)
+- Implementation Summary: `33adad1` (root)
+- Bug Fix - PhaseProgressBar Null Safety: `00e5920` (image-search-ui)
+- Bug Fix - Component Registry Race Conditions: `8a65361` (image-search-ui)
 
 ---
 
@@ -164,6 +167,55 @@ export async function getUnifiedProgress(sessionId: number): Promise<UnifiedProg
 **Commit**: `dcea29b` - `feat(ui): Phase 2 - implement unified training progress display`
 
 **Quality**: ✅ 7/11 tests pass (core functionality validated), no TypeScript errors, no breaking changes
+
+---
+
+### Bug Fixes (Post-Implementation)
+
+#### Bug Fix 1: PhaseProgressBar Null Safety
+
+**Issue**: Runtime error when `phase` prop was undefined during initial load or API errors:
+```
+Cannot read properties of undefined (reading 'status')
+at PhaseProgressBar.svelte:64:14
+```
+
+**Root Cause**: Component assumed `phase` prop would always be defined but it could be undefined during:
+- Initial component load before API response
+- API errors
+- Race conditions during unmount
+
+**Solution Applied**:
+- Updated Props interface to allow `phase: PhaseProgress | undefined`
+- Added null checks in all `$derived` values (statusClass, statusText)
+- Used optional chaining for safe property access (`phase?.status`)
+- Used nullish coalescing for safe defaults (`phase?.progress?.percentage ?? 0`)
+
+**Files Modified**:
+- ✅ `src/lib/components/training/PhaseProgressBar.svelte`
+
+**Commit**: `00e5920` - `fix(ui): add null safety checks to PhaseProgressBar component`
+
+**Quality**: ✅ Type checks pass, production build successful, no runtime errors
+
+#### Bug Fix 2: Component Registry Race Conditions
+
+**Issue**: Occasional `Cannot read property of null` errors during component unmount in development mode when DevOverlay component tracking was active.
+
+**Root Cause**: Race condition in componentRegistry cleanup function when components unmounted rapidly. The cleanup function tried to access `stack.components` which could be null during teardown.
+
+**Solution Applied**:
+- Added defensive null checks in componentRegistry cleanup function
+- Moved cleanup effect to dedicated `$effect` in training page for clearer lifecycle management
+- Ensures cleanup is only called when stack and components still exist
+
+**Files Modified**:
+- ✅ `src/lib/dev/componentRegistry.svelte.ts`
+- ✅ `src/routes/training/+page.svelte`
+
+**Commit**: `8a65361` - `fix(dev): add defensive checks for component registry race conditions`
+
+**Quality**: ✅ ESLint pass, no runtime errors during rapid navigation
 
 ---
 
