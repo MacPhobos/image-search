@@ -3,6 +3,9 @@
 > **Date**: 2026-01-12
 > **Feature**: Queue `propagate_person_label_multiproto_job` after training completion
 > **Configurable**: Admin Panel setting (all persons vs. top N persons)
+> **Status**: ✅ Implemented + Enhanced with centroid mode (2026-01-17)
+
+> **📌 UPDATE**: This feature now supports **centroid-based suggestions** for faster performance (~50x speedup). See [post-training-suggestions-centroid.md](./post-training-suggestions-centroid.md) for details on the centroid enhancement.
 
 ---
 
