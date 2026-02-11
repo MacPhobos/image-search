@@ -26,6 +26,67 @@
 
 The current image-search application can suggest faces for **existing known persons** (via prototype matching, centroid search, and find-more flows) but cannot **discover NEW unknown persons** from the pool of unassigned faces. Users must manually browse individual unassigned faces or existing HDBSCAN clusters to identify new people -- a tedious process when thousands of unassigned faces exist.
 
+---
+
+## 1.5 Resolved Requirements (User Decisions)
+
+**Context**: The following requirements have been finalized based on product direction and affect backend implementation:
+
+### Scale and Performance
+
+| Requirement | Decision | Backend Impact |
+|---|---|---|
+| **Expected scale** | **50,000 unlabeled faces** | O(N²) HDBSCAN is infeasible. MUST use chunked/batched approach or alternative algorithm. Original analysis assumed 5K-10K faces - this is a critical scale change. |
+| **Processing model** | **Pre-computed clustering via background job** | Clustering runs as background job (not on-demand). Default threshold: 0.70. Mandatory async processing. |
+| **Re-computation trigger** | **Triggered on person creation** | After accepting a group and creating a person, auto-trigger re-clustering in background. |
+| **Auto find-more** | **Always trigger after person creation** | Accept/create-person endpoint must enqueue find-more job automatically. |
+
+### Filtering and Pagination
+
+| Requirement | Decision | Backend Impact |
+|---|---|---|
+| **Minimum group size** | **5 faces per group (default)** | Filter groups server-side with `face_count >= 5`. Must be configurable via Admin UI settings (requires admin settings endpoint integration). |
+| **Pagination** | **50 groups per page, sort by face count descending** | Endpoint must support offset/limit pagination and sort by group size (most faces first). |
+| **Default threshold** | **0.70 confidence minimum** | Configurable, but 0.70 is the baseline for production use. |
+
+### Group Management
+
+| Requirement | Decision | Backend Impact |
+|---|---|---|
+| **Dismissed groups** | **Store in database** | Needs new database table or field to track dismissals. Must be keyed by membership hash for stability across re-clustering. |
+| **Group identity** | **Membership hash determines identity** | The set of face IDs in a cluster determines its identity. If the same faces cluster together across runs, it's the "same" group. Requires computing stable hash of sorted face_instance_ids. |
+| **Partial acceptance** | **Accept subset of faces from group** | Accept endpoint must handle `face_ids_to_exclude` parameter. Not all-or-nothing. |
+
+### User Experience
+
+| Requirement | Decision | Backend Impact |
+|---|---|---|
+| **MVP scope** | **"Suggested New Persons" (simpler version first)** | Ship minimal viable feature before advanced enhancements. Focus on core workflow: discover → review → accept/dismiss. |
+| **Auto-refresh** | **UI auto-refreshes when background job completes** | May need SSE/WebSocket or polling endpoint for job status. Reuse existing Redis progress key pattern. |
+
+### Key Architectural Constraints from Decisions
+
+1. **50K scale mandate** requires either:
+   - Chunked/batched HDBSCAN (process N faces at a time, e.g., 10K chunks)
+   - Hierarchical clustering (cluster sub-groups first, then merge)
+   - Approximate clustering (sampling or k-means initialization)
+   - OR accepting longer job execution times (10-30 minutes acceptable for background job)
+
+2. **Membership hash requirement** adds complexity:
+   - Must compute stable hash: `hash(sorted(face_instance_ids))`
+   - Must persist hash with cluster metadata
+   - Must check dismissed table by hash before showing group
+
+3. **Admin settings integration** requires:
+   - New admin settings endpoint or extending existing `SyncConfigService`
+   - Settings: `min_group_size`, `min_confidence`, `auto_trigger_discovery`
+
+4. **Partial acceptance** changes accept flow:
+   - Original design: label entire cluster
+   - New requirement: accept subset, leave remainder unlabeled or in cluster
+
+---
+
 ### Key Finding
 
 The backend already has most of the building blocks needed:
@@ -254,6 +315,13 @@ The unknown person discovery feature should:
 
 ### 4.2 New Endpoints
 
+**Design Notes (Post-Decision Updates)**:
+- All endpoints updated to reflect **50K scale requirement** (chunked processing)
+- **Pagination defaults**: 50 groups per page, sort by face count descending
+- **Admin settings integration**: min_group_size configurable, default 5
+- **Membership hash tracking**: All group responses include stable hash
+- **Partial acceptance**: Accept endpoint supports face exclusion list
+
 #### 4.2.1 Trigger Unknown Person Discovery (Background Job)
 
 ```
@@ -271,24 +339,28 @@ class DiscoverUnknownPersonsRequest(CamelCaseModel):
         description="Clustering algorithm to use",
     )
     min_cluster_size: int = Field(
-        default=3, ge=2, le=50,
-        description="Minimum faces per candidate person group",
+        default=5, ge=2, le=50,
+        description="Minimum faces per candidate person group (default: 5)",
     )
     min_quality: float = Field(
         default=0.3, ge=0.0, le=1.0,
         description="Minimum face quality score to include",
     )
     max_faces: int = Field(
-        default=10000, ge=100, le=50000,
-        description="Maximum unassigned faces to process",
+        default=50000, ge=100, le=100000,
+        description="Maximum unassigned faces to process (default: 50K, supports up to 100K with chunking)",
     )
     min_cluster_confidence: float = Field(
-        default=0.65, ge=0.0, le=1.0,
-        description="Minimum intra-cluster confidence for a candidate group",
+        default=0.70, ge=0.0, le=1.0,
+        description="Minimum intra-cluster confidence for a candidate group (default: 0.70)",
     )
     eps: float = Field(
         default=0.5, ge=0.0, le=2.0,
         description="Distance threshold for DBSCAN/Agglomerative",
+    )
+    chunk_size: int = Field(
+        default=10000, ge=1000, le=20000,
+        description="Chunk size for batched clustering (handles 50K+ faces)",
     )
 ```
 
@@ -321,12 +393,13 @@ GET /api/v1/faces/unknown-persons/candidates
 **Query Parameters**:
 ```python
 page: int = Query(1, ge=1)
-groups_per_page: int = Query(10, ge=1, le=50)
+groups_per_page: int = Query(50, ge=1, le=100)  # Default: 50 per user decision
 faces_per_group: int = Query(6, ge=1, le=20)
-min_confidence: float | None = Query(None, ge=0.0, le=1.0)
-min_group_size: int | None = Query(None, ge=2)
-sort_by: str = Query("confidence", regex="^(confidence|face_count|quality)$")
+min_confidence: float | None = Query(None, ge=0.0, le=1.0)  # Default from admin settings: 0.70
+min_group_size: int | None = Query(None, ge=2)  # Default from admin settings: 5
+sort_by: str = Query("face_count", regex="^(confidence|face_count|quality)$")  # Default: face_count (most faces first)
 sort_order: str = Query("desc", regex="^(asc|desc)$")
+include_dismissed: bool = Query(False)  # Show dismissed groups (default: hide)
 ```
 
 **Response Schema**: `UnknownPersonCandidatesResponse`
@@ -335,24 +408,30 @@ class UnknownPersonCandidateGroup(CamelCaseModel):
     """A candidate unknown person group."""
 
     group_id: str  # cluster_id or generated group identifier
+    membership_hash: str  # Stable hash of sorted face_instance_ids (for dismissal tracking)
     face_count: int  # Total faces in this group
     cluster_confidence: float  # Intra-cluster similarity score
     avg_quality: float  # Average face quality score
     representative_face: FaceInstanceResponse  # Best face for thumbnail
     sample_faces: list[FaceInstanceResponse]  # Limited by faces_per_group
     suggested_name: str | None = None  # Auto-generated placeholder
+    is_dismissed: bool = False  # True if user dismissed this group
+    dismissed_at: datetime | None = None
 
 class UnknownPersonCandidatesResponse(CamelCaseModel):
     """Grouped response for unknown person candidates."""
 
     groups: list[UnknownPersonCandidateGroup]
-    total_groups: int  # Total candidate groups
+    total_groups: int  # Total candidate groups (excluding dismissed unless include_dismissed=True)
     total_unassigned_faces: int  # Total unassigned faces in system
     total_noise_faces: int  # Faces not in any cluster (noise)
+    total_dismissed_groups: int  # Number of dismissed groups
     page: int
     groups_per_page: int
     faces_per_group: int
     last_discovery_at: datetime | None  # When discovery was last run
+    min_group_size_setting: int  # Current admin setting for min_group_size
+    min_confidence_setting: float  # Current admin setting for min_confidence
 ```
 
 **Behavior**:
@@ -407,11 +486,15 @@ class AcceptUnknownPersonRequest(CamelCaseModel):
     name: str = Field(min_length=1, max_length=255)
     auto_find_more: bool = Field(
         default=True,
-        description="Automatically trigger find-more after creating person",
+        description="Automatically trigger find-more after creating person (ALWAYS True per user decision)",
     )
     face_ids_to_exclude: list[UUID] | None = Field(
         default=None,
-        description="Optional list of face IDs to exclude from the new person",
+        description="Optional list of face IDs to exclude from the new person (partial acceptance)",
+    )
+    trigger_reclustering: bool = Field(
+        default=True,
+        description="Trigger re-clustering in background after person creation",
     )
 ```
 
@@ -423,18 +506,25 @@ class AcceptUnknownPersonResponse(CamelCaseModel):
     person_id: UUID
     person_name: str
     faces_assigned: int
+    faces_excluded: int
     prototypes_created: int
-    find_more_job_id: str | None = None  # If auto_find_more was triggered
+    find_more_job_id: str  # ALWAYS triggered per user decision
+    reclustering_job_id: str | None = None  # If trigger_reclustering=True
 ```
 
-**Behavior**:
+**Behavior** (Updated per user decisions):
 1. Validates the group exists and is not already labeled
 2. Creates a new `Person` record
-3. Assigns all faces (minus excluded) to the new person
-4. Creates prototypes (representative + exemplars)
-5. Syncs to Qdrant
-6. Optionally triggers find-more job
-7. This is essentially the same as `POST /faces/clusters/{cluster_id}/label` but with the unknown persons UX context
+3. **Assigns selected faces** (all faces MINUS face_ids_to_exclude) to the new person
+4. **Leaves excluded faces unlabeled** (remain in pool for future clustering)
+5. Creates prototypes (representative + exemplars from assigned faces only)
+6. Syncs to Qdrant (update person_id for assigned faces)
+7. **ALWAYS triggers find-more job** (auto_find_more parameter kept for backward compat but defaults to True)
+8. **Triggers re-clustering job** if trigger_reclustering=True (default) to refresh candidate groups
+9. This is essentially the same as `POST /faces/clusters/{cluster_id}/label` but with:
+   - Partial acceptance support (face exclusion)
+   - Mandatory find-more trigger
+   - Optional re-clustering trigger
 
 #### 4.2.5 Dismiss Unknown Person Candidate
 
@@ -463,14 +553,22 @@ class DismissUnknownPersonResponse(CamelCaseModel):
     """Response from dismissing a candidate."""
 
     group_id: str
+    membership_hash: str  # Hash of the dismissed group (stable across re-clustering)
     faces_affected: int
     marked_as_noise: bool
 ```
 
-**Behavior**:
-1. If `mark_as_noise=True`: Set `cluster_id = '-1'` on all faces in the group (prevents re-clustering)
-2. If `mark_as_noise=False`: Clear `cluster_id` on all faces (allows re-clustering with different params)
-3. Optionally store the dismissal for analytics
+**Behavior** (Updated per user decisions):
+1. **Compute membership hash**: `hash(sorted(face_instance_ids))` to create stable group identity
+2. **Store dismissal record** in database (new table or field) keyed by membership_hash
+3. If `mark_as_noise=True`:
+   - Set `cluster_id = '-1'` on all faces in the group (prevents re-clustering)
+   - Record dismissal with noise flag
+4. If `mark_as_noise=False`:
+   - Keep `cluster_id` unchanged (allows faces to appear in different groups after re-clustering)
+   - Record dismissal with membership hash (if same faces cluster together again, group remains dismissed)
+5. Dismissed groups are hidden from candidate listing by default (unless `include_dismissed=True`)
+6. **Key requirement**: Dismissal persists across re-clustering runs. If the same set of faces clusters together again, the group remains dismissed.
 
 #### 4.2.6 Unknown Persons Discovery Stats
 
@@ -509,40 +607,97 @@ class UnknownPersonsStatsResponse(CamelCaseModel):
 
 ## 5. Implementation Strategy
 
-### 5.1 Phase 1: Leverage Existing Clusters (Minimal New Code)
+### 5.1 Phase 1: MVP Implementation (Updated per User Decisions)
 
-The simplest approach reuses the existing `cluster_id` on `FaceInstance` populated by `cluster_dual_job()`:
+**Goal**: Ship "Suggested New Persons" feature with 50K scale support.
 
-**No new database tables needed** for Phase 1. The existing clusters (`FaceInstance.cluster_id`) already represent candidate person groups. The new endpoints simply query and present these clusters differently.
+**Key Changes from Original Analysis**:
+- ✅ Pre-computed clustering (mandatory, not optional)
+- ✅ Dismissed groups database table (new requirement)
+- ✅ Membership hash tracking (new requirement)
+- ✅ Partial acceptance support (face exclusion list)
+- ✅ Auto find-more trigger (always enabled)
+- ✅ Re-clustering trigger (optional but default true)
+- ✅ Admin settings integration (min_group_size=5, min_confidence=0.70)
+- ✅ 50 groups per page, sort by face count descending
 
 #### Implementation Steps:
 
-1. **New route file**: `api/routes/unknown_persons.py`
-   - Register router in `main.py` under `/api/v1/faces/unknown-persons`
+1. **Database migration** (NEW - required for MVP):
+   - Create `dismissed_unknown_person_groups` table
+   - Add indexes: membership_hash (unique), cluster_id, dismissed_at
+   - Migration: `alembic revision -m "Add dismissed unknown person groups table"`
 
-2. **New schema file**: `api/unknown_person_schemas.py`
+2. **New route file**: `api/routes/unknown_persons.py`
+   - Register router in `main.py` under `/api/v1/faces/unknown-persons`
+   - All endpoints from Section 4.2 (updated with user decisions)
+
+3. **New schema file**: `api/schemas/unknown_person_schemas.py`
    - All schemas from Section 4.2 above
    - Follow CamelCaseModel pattern
+   - Include membership_hash in responses
 
-3. **Stats endpoint** (`GET /stats`):
+4. **New service file**: `services/unknown_person_service.py` (NEW)
+   - `compute_membership_hash(face_ids: list[UUID]) -> str`
+   - `is_group_dismissed(membership_hash: str) -> bool`
+   - `dismiss_group(membership_hash: str, cluster_id: str, face_count: int, reason: str | None, mark_as_noise: bool)`
+   - `get_dismissed_groups() -> list[DismissedUnknownPersonGroup]`
+
+5. **Stats endpoint** (`GET /stats`):
    - Query: `SELECT COUNT(*) FROM face_instances WHERE person_id IS NULL`
    - Query: `SELECT COUNT(*) FROM face_instances WHERE person_id IS NULL AND cluster_id IS NOT NULL AND cluster_id != '-1'`
    - Query: `SELECT COUNT(DISTINCT cluster_id) FROM face_instances WHERE person_id IS NULL AND cluster_id IS NOT NULL AND cluster_id != '-1'`
+   - Query: `SELECT COUNT(*) FROM dismissed_unknown_person_groups` (NEW)
 
-4. **Candidates listing** (`GET /candidates`):
-   - Reuse the same SQL pattern from `list_clusters()` with filter `include_labeled=False`
-   - Add confidence computation (either pre-computed or sampled)
-   - Return grouped response
+6. **Candidates listing** (`GET /candidates`):
+   - Reuse SQL pattern from `list_clusters()` with filter `include_labeled=False`
+   - **Compute membership hash for each group** (for dismissal check)
+   - **Filter out dismissed groups** (unless `include_dismissed=True`)
+   - Add confidence computation (pre-computed or sampled)
+   - **Default sort**: face_count DESC (most faces first)
+   - **Default pagination**: 50 groups per page
+   - Return grouped response with admin settings (min_group_size, min_confidence)
 
-5. **Accept endpoint** (`POST /candidates/{group_id}/accept`):
-   - Delegate to existing `label_cluster()` logic from `faces.py`
-   - Extract to shared service layer: `ClusterLabelingService`
+7. **Accept endpoint** (`POST /candidates/{group_id}/accept`):
+   - Validate group exists and not already labeled
+   - **NEW**: Handle `face_ids_to_exclude` parameter (partial acceptance)
+   - Create new Person
+   - Assign faces (minus excluded) to person
+   - **Leave excluded faces unlabeled** (remain in pool)
+   - Create prototypes (from assigned faces only)
+   - Sync to Qdrant
+   - **ALWAYS trigger find-more job** (auto_find_more=True by default)
+   - **Optionally trigger re-clustering job** (trigger_reclustering=True by default)
+   - Return response with both job IDs
 
-6. **Dismiss endpoint** (`POST /candidates/{group_id}/dismiss`):
-   - Simple SQL UPDATE on `FaceInstance.cluster_id`
+8. **Dismiss endpoint** (`POST /candidates/{group_id}/dismiss`):
+   - Query all faces in group
+   - **Compute membership hash** from face IDs
+   - **Store dismissal record** in `dismissed_unknown_person_groups` table
+   - If `mark_as_noise=True`: Set `cluster_id = '-1'` on all faces
+   - If `mark_as_noise=False`: Keep cluster_id unchanged
+   - Return response with membership hash
 
-7. **Discover endpoint** (`POST /discover`):
-   - Enqueue `cluster_dual_job()` or new `discover_unknown_persons_job()`
+9. **Discover endpoint** (`POST /discover`):
+   - Validate parameters (default: min_cluster_size=5, min_confidence=0.70, max_faces=50K, chunk_size=10K)
+   - Enqueue new `discover_unknown_persons_job()` (background job)
+   - Return job_id and progress_key for SSE tracking
+
+10. **New background job**: `discover_unknown_persons_job()` in `queue/face_jobs.py`
+    - Step 1: Get unassigned face embeddings from Qdrant
+    - Step 2: Run HDBSCAN clustering (with chunking support for 50K+ faces)
+    - Step 3: Compute cluster quality metrics (confidence, avg quality)
+    - Step 4: **Compute membership hash for each cluster**
+    - Step 5: Filter by min_cluster_size and min_confidence
+    - Step 6: Update `FaceInstance.cluster_id` for all faces
+    - Step 7: Report progress via Redis SSE
+    - Note: Job may take 10-30 minutes for 50K faces (acceptable for MVP)
+
+11. **Admin settings integration**:
+    - Extend `SyncConfigService` or create new settings table
+    - Settings: `unknown_person_min_group_size`, `unknown_person_min_confidence`, `unknown_person_max_faces`, `unknown_person_chunk_size`
+    - Default values: 5, 0.70, 50000, 10000
+    - Expose via admin API endpoints (or reuse existing config endpoints)
 
 ### 5.2 Phase 2: Enhanced Discovery (New Background Job)
 
@@ -569,10 +724,50 @@ Future enhancements:
 
 ### 5.4 Database Schema Changes
 
-#### Phase 1: No schema changes
-- Reuse existing `FaceInstance.cluster_id` and `FaceInstance.person_id`
+#### Phase 1: Minimal schema changes (MVP)
 
-#### Phase 2: Optional metadata table
+**Required for user decisions**:
+- New table: `dismissed_unknown_person_groups` (track dismissed groups by membership hash)
+- Reuse existing `FaceInstance.cluster_id` and `FaceInstance.person_id` (no changes)
+
+```python
+class DismissedUnknownPersonGroup(Base):
+    """Tracks dismissed candidate person groups by membership hash.
+
+    Key requirement: Dismissed groups persist across re-clustering runs.
+    If the same set of faces clusters together again, the group remains dismissed.
+    """
+    __tablename__ = "dismissed_unknown_person_groups"
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
+    membership_hash: Mapped[str] = mapped_column(String(64), unique=True, index=True)  # SHA256 of sorted face_instance_ids
+    cluster_id: Mapped[str | None] = mapped_column(String(50), nullable=True, index=True)  # Current cluster_id (may change across runs)
+    face_count: Mapped[int] = mapped_column(Integer)  # Number of faces when dismissed
+    reason: Mapped[str | None] = mapped_column(Text, nullable=True)  # Optional dismissal reason
+    marked_as_noise: Mapped[bool] = mapped_column(Boolean, default=False)  # True if faces marked as noise
+    dismissed_at: Mapped[datetime] = mapped_column(server_default=func.now())
+    dismissed_by: Mapped[str | None] = mapped_column(String(255), nullable=True)  # Future: user identification
+
+    # Optional: Store face IDs for debugging (JSON array)
+    face_instance_ids: Mapped[list[str] | None] = mapped_column(JSON, nullable=True)
+```
+
+**Membership Hash Computation**:
+```python
+import hashlib
+import json
+
+def compute_membership_hash(face_instance_ids: list[uuid.UUID]) -> str:
+    """Compute stable hash of face instance IDs.
+
+    Same set of faces always produces same hash, regardless of order or cluster_id.
+    """
+    sorted_ids = sorted(str(fid) for fid in face_instance_ids)
+    hash_input = json.dumps(sorted_ids, sort_keys=True)
+    return hashlib.sha256(hash_input.encode()).hexdigest()
+```
+
+#### Phase 2: Enhanced metadata tables (optional, post-MVP)
 
 ```python
 class UnknownPersonDiscovery(Base):
@@ -580,12 +775,13 @@ class UnknownPersonDiscovery(Base):
     __tablename__ = "unknown_person_discoveries"
 
     id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
-    job_id: Mapped[str] = mapped_column(String(36))
+    job_id: Mapped[str] = mapped_column(String(36), index=True)
     status: Mapped[str] = mapped_column(String(20))  # completed/failed
-    params: Mapped[dict] = mapped_column(JSON)
+    params: Mapped[dict] = mapped_column(JSON)  # Clustering parameters used
     total_faces_processed: Mapped[int] = mapped_column(Integer)
     clusters_found: Mapped[int] = mapped_column(Integer)
     noise_count: Mapped[int] = mapped_column(Integer)
+    execution_time_seconds: Mapped[float | None] = mapped_column(Float, nullable=True)
     created_at: Mapped[datetime] = mapped_column(server_default=func.now())
 
 class ClusterMetadata(Base):
@@ -593,51 +789,83 @@ class ClusterMetadata(Base):
     __tablename__ = "cluster_metadata"
 
     cluster_id: Mapped[str] = mapped_column(String(50), primary_key=True)
+    membership_hash: Mapped[str] = mapped_column(String(64), unique=True, index=True)  # Stable identity
     face_count: Mapped[int] = mapped_column(Integer)
     cluster_confidence: Mapped[float] = mapped_column(Float)
     avg_quality: Mapped[float] = mapped_column(Float)
     representative_face_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("face_instances.id"))
     centroid_vector_id: Mapped[uuid.UUID | None] = mapped_column(nullable=True)
     discovery_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("unknown_person_discoveries.id"))
-    dismissed: Mapped[bool] = mapped_column(Boolean, default=False)
-    dismissed_at: Mapped[datetime | None] = mapped_column(nullable=True)
     created_at: Mapped[datetime] = mapped_column(server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(server_default=func.now(), onupdate=func.now())
+```
+
+**Admin Settings Integration** (extends existing `SyncConfigService` or new table):
+```python
+# Add to existing config service or new settings table
+{
+    "unknown_person_min_group_size": 5,  # Default: 5 faces
+    "unknown_person_min_confidence": 0.70,  # Default: 0.70
+    "unknown_person_auto_trigger_discovery": False,  # Default: manual trigger
+    "unknown_person_max_faces": 50000,  # Default: 50K
+    "unknown_person_chunk_size": 10000,  # Default: 10K
+}
 ```
 
 ---
 
 ## 6. Performance Analysis
 
-### 6.1 Scale Considerations
+**⚠️ CRITICAL SCALE UPDATE**: User decision mandates **50,000 unlabeled faces** as the expected production scale, not 5K-10K as originally analyzed. This changes all performance requirements.
 
-| Metric | Typical Value | Worst Case | Impact |
-|---|---|---|---|
-| Total faces in Qdrant | 5,000-20,000 | 100,000+ | Scroll + filter time for unlabeled faces |
-| Unassigned faces | 500-5,000 | 50,000+ | HDBSCAN computation time |
-| Existing clusters | 50-200 | 1,000+ | Listing query time |
-| Faces per cluster | 3-50 | 500+ | Confidence computation time |
+### 6.1 Scale Considerations (Updated for 50K Target)
 
-### 6.2 Computational Cost Analysis
+| Metric | Original Analysis | **User Decision** | Impact |
+|---|---|---|---|---|
+| Total faces in Qdrant | 5,000-20,000 | 50,000-100,000 | Scroll + filter time significantly longer |
+| **Unassigned faces** | 500-5,000 | **50,000** | **HDBSCAN O(N²) = 10-30 minutes with standard approach** |
+| Existing clusters | 50-200 | 500-1,000 | Listing query time manageable with indexes |
+| Faces per cluster | 3-50 | 5-100 | Confidence computation time (sampling already handles this) |
+| **Min group size** | 2-3 | **5 (default)** | Fewer groups to display, better quality |
+| **Groups per page** | 10 | **50** | More data per response, requires efficient pagination |
+
+### 6.2 Computational Cost Analysis (Revised for 50K Scale)
 
 #### Retrieving Unassigned Faces from Qdrant
 
 **Current approach** (`get_unlabeled_faces_with_embeddings()`):
 - Scrolls ALL faces (100 per page) and filters in Python for missing `person_id`
-- For 20,000 total faces with 5,000 unassigned: 200 scroll requests, ~10-20 seconds
-- For 100,000 total faces with 50,000 unassigned: 1,000 scroll requests, ~50-100 seconds
+- **For 50,000 unassigned faces**: ~500 scroll requests, ~25-50 seconds
+- **For 100,000 total faces with 50,000 unassigned**: 1,000 scroll requests, ~50-100 seconds
 
-**Optimization opportunity**:
+**Optimization opportunity** (CRITICAL for 50K scale):
 - Add a Qdrant payload index on `person_id` and use `must_not` filter with a sentinel value (e.g., store `"unassigned"` instead of omitting the field)
 - Or maintain a separate "unassigned faces" collection (write complexity vs read performance tradeoff)
+- **Recommendation**: Implement Qdrant filter optimization BEFORE 50K deployment
 
-#### HDBSCAN Clustering
+#### HDBSCAN Clustering (CRITICAL BOTTLENECK)
 
-- **Time complexity**: O(N^2) for distance matrix computation where N = number of faces
-- **For 5,000 faces**: ~2-5 seconds (well-suited for background job)
-- **For 50,000 faces**: ~200-500 seconds (requires batching or sampling)
-- **Memory**: O(N^2) for distance matrix -- 5,000 faces = ~100MB, 50,000 faces = ~10GB
+- **Time complexity**: O(N²) for distance matrix computation where N = number of faces
+- **For 5,000 faces**: ~2-5 seconds (original analysis - ACCEPTABLE)
+- **⚠️ For 50,000 faces**: ~200-500 seconds (3-8 minutes) BEST CASE, potentially 10-30 minutes
+- **Memory**: O(N²) for distance matrix -- 5,000 faces = ~100MB, **50,000 faces = ~10GB** (may exceed worker memory limits)
 
-**Recommendation**: Cap `max_faces` at 10,000-20,000 for interactive use. For larger datasets, use sampling or incremental approaches.
+**MANDATORY MITIGATION STRATEGIES for 50K scale**:
+
+| Strategy | Pros | Cons | Feasibility |
+|---|---|---|---|
+| **Chunked/Batched HDBSCAN** | Process N faces at a time (e.g., 10K chunks), merge clusters | Reduced memory, parallelizable | Medium complexity, best ROI |
+| **Hierarchical Clustering** | Cluster sub-groups first, merge hierarchically | Handles large N efficiently | High complexity |
+| **Approximate Clustering** | Sample subset (e.g., 20K faces) for clustering | Fast, low memory | May miss small clusters |
+| **Accept Long Job Times** | Simple implementation, no algorithm changes | 10-30 minute background jobs | Low complexity, acceptable for MVP |
+| **Two-tier Discovery** | Fast clustering on 10K sample, full clustering on-demand | Best UX + performance balance | Medium complexity |
+
+**Recommended Approach for MVP**:
+1. **Accept 10-30 minute job execution times** for initial MVP (background job is async, users can continue working)
+2. **Implement chunked HDBSCAN** in Phase 2 if job times become problematic
+3. **Monitor job execution times** and adjust strategy based on real-world data
+
+**Implementation Note**: The `chunk_size` parameter in `DiscoverUnknownPersonsRequest` (default 10K) enables chunked processing from the start.
 
 #### Cluster Confidence Computation
 
@@ -645,31 +873,51 @@ class ClusterMetadata(Base):
 - Already samples max 20 faces for large clusters (existing optimization)
 - For 200 clusters of average size 25: ~200 * 190 comparisons = negligible
 
-### 6.3 Pre-compute vs On-demand
+### 6.3 Pre-compute vs On-demand (RESOLVED)
 
-| Approach | Pros | Cons |
+**User Decision**: **Pre-computed clustering via background job** (MANDATORY, not optional)
+
+| Approach | User Decision | Rationale |
 |---|---|---|
-| **Pre-compute (background job)** | Fast browsing, no wait for user | Stale if new faces added; storage overhead |
-| **On-demand (API-triggered)** | Always fresh results | Slow for large datasets; blocks user flow |
-| **Hybrid (recommended)** | Fast browsing with refresh option | Slightly more complex; best UX |
+| **Pre-compute (background job)** | ✅ **SELECTED** | 50K faces = 10-30 minute clustering time. MUST be background job. |
+| **On-demand (API-triggered)** | ❌ **REJECTED** | Too slow for 50K scale. Users cannot wait 10-30 minutes for results. |
+| **Hybrid** | Partial (refresh button only) | Pre-compute is primary mode, "refresh" triggers new background job |
 
-**Recommended approach**: Pre-compute clusters via background job (triggered after face detection sessions or manually), with a "Refresh" button that re-runs discovery.
+**Implementation**:
+- Clustering ALWAYS runs as background job
+- "Discover" button enqueues job, UI shows progress via SSE
+- "Refresh" button re-triggers discovery job
+- UI auto-refreshes when job completes (SSE notification or polling)
 
 ### 6.4 Caching Strategy
 
-1. **Redis cache for cluster metadata**: Cache cluster stats (face_count, confidence, representative_face) with TTL of 1 hour
-2. **Invalidation triggers**: New face detection, face assignment changes, cluster relabeling
-3. **Progress tracking**: Reuse existing Redis progress key pattern from find-more jobs
+**Updated for 50K scale and membership hash requirement**:
 
-### 6.5 Response Time Targets
+1. **Redis cache for cluster metadata**: Cache cluster stats (face_count, confidence, representative_face, **membership_hash**) with TTL of 1 hour
+2. **Membership hash computation**: Compute once during discovery job, store in cluster metadata table
+3. **Dismissed groups cache**: Store dismissed membership hashes in Redis for fast filtering (avoid DB query on every listing)
+4. **Invalidation triggers**:
+   - New face detection (trigger re-clustering job)
+   - Face assignment changes (person created, faces assigned)
+   - Cluster dismissal (update dismissed cache)
+5. **Progress tracking**: Reuse existing Redis progress key pattern from find-more jobs
 
-| Endpoint | Target | Strategy |
-|---|---|---|
-| `GET /candidates` (pre-computed) | <200ms | SQL query + cached confidence |
-| `GET /candidates` (on-demand confidence) | <2s | Sample-based confidence computation |
-| `GET /candidates/{id}` | <500ms | Direct cluster query |
-| `POST /discover` | Immediate (async) | Returns job_id, work happens in background |
-| `POST /candidates/{id}/accept` | <1s | Transaction: create person + assign faces |
+### 6.5 Response Time Targets (Updated for 50K Scale)
+
+| Endpoint | Target | Strategy | 50K Scale Impact |
+|---|---|---|---|
+| `GET /candidates` | <500ms | SQL query + pre-computed confidence + membership hash | Group count increased (50/page), dismissed filter added |
+| `GET /candidates/{id}` | <1s | Direct cluster query (may return 50-100 faces) | Larger groups = more data |
+| `POST /discover` | Immediate (async) | Returns job_id, work happens in background | Job execution time: 10-30 minutes for 50K faces |
+| `POST /candidates/{id}/accept` | <3s | Transaction: create person + assign faces + trigger find-more + trigger re-clustering | Additional jobs enqueued (find-more + re-cluster) |
+| `POST /candidates/{id}/dismiss` | <500ms | Store dismissal record with membership hash | Simple DB write |
+| `GET /stats` | <200ms | Cached aggregates | No change |
+
+**Key Performance Note**: Job execution time (10-30 minutes for 50K faces) is acceptable because:
+1. Job is fully asynchronous (users can browse other features)
+2. Progress visible via SSE (users know job is working)
+3. Auto-refresh on completion (users notified when results ready)
+4. Pre-computed results remain cached until next discovery run
 
 ---
 
@@ -811,20 +1059,35 @@ This exact pattern should be reused for the accept-unknown-person flow.
 
 ## 8. Recommendations
 
-### 8.1 Implementation Priority
+### 8.1 Implementation Priority (Updated per User Decisions)
 
-| Priority | Item | Effort | Impact |
-|---|---|---|---|
-| P0 | `GET /candidates` (listing from existing clusters) | Small | High -- immediate value |
-| P0 | `GET /candidates/{id}` (detail view) | Small | High -- essential for UX |
-| P0 | `POST /candidates/{id}/accept` (reuse label_cluster logic) | Small | High -- completes the flow |
-| P1 | `POST /candidates/{id}/dismiss` | Small | Medium -- cleanup flow |
-| P1 | `GET /stats` | Small | Medium -- dashboard insight |
-| P1 | `POST /discover` (trigger re-clustering) | Medium | High -- enables fresh discovery |
-| P2 | Similar person matching (centroid comparison) | Medium | Medium -- helps identify duplicates |
-| P2 | Pre-computed cluster metadata table | Medium | Medium -- improves listing performance |
-| P3 | Incremental clustering | Large | High -- scalability for 100k+ faces |
-| P3 | Active learning from user feedback | Large | Medium -- improves accuracy over time |
+**⚠️ Priority changes based on user decisions**: Dismissal storage and membership hash tracking moved to P0 (required for MVP).
+
+| Priority | Item | Effort | Impact | User Decision Impact |
+|---|---|---|---|---|
+| **P0 (MVP Blockers)** | | | | |
+| P0 | Database migration: `dismissed_unknown_person_groups` table | Small | High | **NEW REQUIREMENT** - dismissal persistence |
+| P0 | Membership hash computation and storage | Small | High | **NEW REQUIREMENT** - stable group identity |
+| P0 | `POST /discover` (trigger discovery job) | Medium | High | **MANDATORY** - pre-computed clustering only |
+| P0 | `discover_unknown_persons_job()` with 50K scale support | Large | High | **CRITICAL** - chunked processing for 50K faces |
+| P0 | `GET /candidates` (listing with dismissal filter) | Medium | High | **UPDATED** - filter dismissed groups, 50/page, sort by face_count |
+| P0 | `GET /candidates/{id}` (detail view) | Small | High | Essential for UX |
+| P0 | `POST /candidates/{id}/accept` with partial acceptance | Medium | High | **UPDATED** - face exclusion list, auto find-more, re-clustering trigger |
+| P0 | `POST /candidates/{id}/dismiss` with hash storage | Medium | High | **UPDATED** - store to DB, membership hash tracking |
+| P0 | Admin settings integration (min_group_size, min_confidence) | Small | Medium | **NEW REQUIREMENT** - configurable defaults |
+| **P1 (MVP Nice-to-Have)** | | | | |
+| P1 | `GET /stats` with dismissed groups count | Small | Medium | Dashboard insight + dismissed group visibility |
+| P1 | SSE progress tracking for discovery job | Small | High | Reuse existing pattern, 10-30 min jobs need progress |
+| P1 | Redis cache for dismissed groups (fast filtering) | Small | Medium | Performance optimization for listing |
+| **P2 (Post-MVP Enhancements)** | | | | |
+| P2 | Chunked HDBSCAN (if MVP job times problematic) | Large | High | Performance optimization for 50K+ scale |
+| P2 | Qdrant filter optimization (sentinel value for person_id) | Medium | High | Performance optimization for retrieval |
+| P2 | Pre-computed cluster metadata table | Medium | Medium | Performance optimization for listing |
+| P2 | Similar person matching (centroid comparison) | Medium | Medium | Helps identify duplicates |
+| **P3 (Future)** | | | | |
+| P3 | Incremental clustering | Large | High | Scalability for 100K+ faces |
+| P3 | Active learning from user feedback | Large | Medium | Improves accuracy over time |
+| P3 | Two-tier discovery (sample + full clustering) | Large | High | UX + performance balance |
 
 ### 8.2 Architecture Decisions
 
@@ -868,7 +1131,7 @@ Frontend types must be regenerated after backend changes: `npm run gen:api`.
 
 ### 8.6 Configuration Additions
 
-New settings for `core/config.py`:
+New settings for `core/config.py` (updated for user decisions):
 
 ```python
 # Unknown person discovery settings
@@ -877,18 +1140,120 @@ unknown_person_discovery_auto_trigger: bool = Field(
     description="Auto-trigger discovery after face detection sessions",
 )
 unknown_person_min_cluster_size: int = Field(
-    default=3, ge=2,
-    description="Minimum faces per candidate person group",
+    default=5, ge=2, le=50,
+    description="Minimum faces per candidate person group (default: 5 per user decision)",
 )
 unknown_person_min_confidence: float = Field(
-    default=0.65, ge=0.0, le=1.0,
-    description="Minimum cluster confidence for candidate groups",
+    default=0.70, ge=0.0, le=1.0,
+    description="Minimum cluster confidence for candidate groups (default: 0.70 per user decision)",
 )
 unknown_person_max_faces: int = Field(
-    default=10000, ge=100,
-    description="Maximum unassigned faces to process during discovery",
+    default=50000, ge=100, le=100000,
+    description="Maximum unassigned faces to process during discovery (default: 50K per user decision)",
+)
+unknown_person_chunk_size: int = Field(
+    default=10000, ge=1000, le=20000,
+    description="Chunk size for batched clustering to handle 50K+ faces",
+)
+unknown_person_groups_per_page: int = Field(
+    default=50, ge=1, le=100,
+    description="Default groups per page in candidate listing (default: 50 per user decision)",
 )
 ```
+
+### 8.7 Scale Concerns and Mitigation Plan
+
+**⚠️ CRITICAL CONCERNS** arising from 50K scale requirement:
+
+| Concern | Original Analysis | User Requirement | Gap | Mitigation |
+|---|---|---|---|---|
+| **HDBSCAN Performance** | Analyzed for 5K-10K faces (2-5s) | **50K faces expected** | 10-30 minute execution time | Accept long job time for MVP, implement chunked clustering in Phase 2 |
+| **Memory Usage** | 5K faces = ~100MB | 50K faces = ~10GB | May exceed worker memory limits | Monitor memory usage, implement chunked processing if needed |
+| **Qdrant Scroll Performance** | Acceptable for 20K total faces | 50K-100K total faces expected | 50-100 second retrieval time | Implement Qdrant filter optimization (sentinel value for person_id) |
+| **Group Count** | 50-200 groups expected | Potentially 500-1,000+ groups | Pagination performance, UI scrolling | Implemented: 50 groups/page, sort by face count (most faces first) |
+| **Dismissed Groups Storage** | Not originally analyzed | Must persist across re-clustering | Membership hash computation cost | Compute once during discovery, cache in Redis for fast filtering |
+| **Re-clustering Trigger** | Not originally analyzed | Trigger after person creation | Multiple long-running jobs in sequence | Queue jobs with appropriate priority, show job status in UI |
+| **Partial Acceptance** | Full cluster labeling only | Accept subset of faces from group | Remaining faces stay in pool | Modified accept flow: exclude selected faces, leave unlabeled |
+
+**Recommended Pre-Deployment Testing** for 50K scale:
+1. **Load test HDBSCAN** with 50K synthetic embeddings to measure actual execution time and memory usage
+2. **Benchmark Qdrant scroll** with 100K faces to validate retrieval time estimates
+3. **Test chunked clustering** implementation with various chunk sizes (5K, 10K, 20K)
+4. **Validate membership hash** stability across re-clustering runs (same faces = same hash)
+5. **Monitor Redis memory** for dismissed groups cache with 1,000+ dismissed groups
+6. **Test re-clustering trigger** after person creation (ensure job doesn't block accept flow)
+
+**Phase 2 Optimization Priorities** (if MVP performance insufficient):
+1. **P0**: Chunked HDBSCAN processing (10K chunks with hierarchical merging)
+2. **P0**: Qdrant filter optimization (sentinel value for unassigned faces)
+3. **P1**: Redis cache for cluster metadata (reduce DB queries on listing)
+4. **P1**: Background job priority tuning (prevent re-clustering from blocking find-more)
+5. **P2**: Incremental clustering (only re-cluster newly detected faces)
+6. **P2**: Approximate clustering (sample-based for initial discovery, full clustering on-demand)
+
+---
+
+## 9. Summary of Changes from Original Analysis
+
+**Document Update**: 2026-02-11
+**Reason**: User decisions finalized, major scale requirement change
+
+### 9.1 Critical Changes
+
+| Area | Original Analysis | User Decision | Impact |
+|---|---|---|---|
+| **Scale** | 5K-10K unlabeled faces | **50K unlabeled faces** | HDBSCAN execution time: 2-5s → 10-30 min. Mandatory chunked processing. |
+| **Processing Mode** | Optional pre-compute vs on-demand | **Pre-computed only (mandatory)** | Background job is the only mode. No on-demand clustering. |
+| **Dismissal Storage** | Optional analytics | **Database storage (required)** | New table: `dismissed_unknown_person_groups` with membership hash tracking. |
+| **Group Identity** | Cluster ID (unstable) | **Membership hash (stable)** | Dismissals persist across re-clustering runs. Same faces = same group. |
+| **Acceptance Mode** | Full cluster labeling | **Partial acceptance (subset)** | Accept endpoint handles face exclusion list. Remaining faces stay unlabeled. |
+| **Find-More** | Optional trigger | **Always trigger (mandatory)** | Auto find-more after person creation is always enabled. |
+| **Re-clustering** | Not analyzed | **Trigger after person creation** | New requirement: re-cluster background job after accept. |
+| **Min Group Size** | 2-3 faces (default) | **5 faces (default)** | Fewer groups, higher quality. Configurable via admin settings. |
+| **Pagination** | 10 groups/page | **50 groups/page** | More data per response, sort by face count descending. |
+| **Default Confidence** | 0.65 | **0.70** | Higher quality threshold. |
+
+### 9.2 New Requirements
+
+1. **Database migration**: Create `dismissed_unknown_person_groups` table
+2. **Membership hash service**: Compute and store stable group identities
+3. **Chunked clustering**: Support 50K+ faces with configurable chunk size (default 10K)
+4. **Admin settings integration**: Expose min_group_size, min_confidence, max_faces, chunk_size
+5. **Partial acceptance logic**: Accept subset of faces from group, leave remainder unlabeled
+6. **Re-clustering trigger**: Auto-trigger re-clustering after person creation
+7. **Dismissed groups filter**: Hide dismissed groups from listing by default
+8. **Performance monitoring**: Track job execution time for 50K scale optimization
+
+### 9.3 MVP Scope ("Suggested New Persons")
+
+**In Scope**:
+- Pre-computed clustering via background job (10-30 min execution time acceptable)
+- List candidate groups with pagination (50/page, sort by face count)
+- Accept group as new person (with partial acceptance support)
+- Dismiss group (with membership hash tracking and DB storage)
+- Stats endpoint (with dismissed groups count)
+- Admin settings for min_group_size (default 5) and min_confidence (default 0.70)
+- Auto find-more after person creation (always enabled)
+- Auto re-clustering after person creation (optional, default enabled)
+
+**Out of Scope** (Post-MVP):
+- Chunked HDBSCAN optimization (accept long job times for MVP)
+- Qdrant filter optimization (accept scroll performance for MVP)
+- Similar person matching (centroid comparison)
+- Incremental clustering
+- Active learning from user feedback
+- Two-tier discovery (sample + full clustering)
+
+### 9.4 Risk Mitigation Plan
+
+| Risk | Likelihood | Mitigation |
+|---|---|---|
+| HDBSCAN too slow for 50K faces | Medium | Accept 10-30 min job time for MVP; implement chunked HDBSCAN in Phase 2 if needed |
+| Worker memory exceeded (10GB for 50K faces) | Medium | Monitor memory usage; implement chunked processing if exceeded |
+| Qdrant scroll too slow (50-100s for 50K faces) | Medium | Accept scroll time for MVP; implement filter optimization in Phase 2 |
+| User confusion with dismissed groups | Low | Clear UX messaging; show dismissed count in stats |
+| Re-clustering job blocks find-more | Low | Use job priority queues; show job status in UI |
+| Membership hash collisions | Very Low | Use SHA256 (64 hex chars); collision probability negligible |
 
 ---
 
